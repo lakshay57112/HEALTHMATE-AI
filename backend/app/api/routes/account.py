@@ -32,7 +32,7 @@ from app.models import (
 from app.services import scheduling, timeutil
 from app.services.audit import audit
 from app.services.ocr import _tesseract_available
-from app.services.storage import get_storage
+from app.services.storage import delete_file
 
 router = APIRouter(tags=["account"])
 
@@ -83,7 +83,7 @@ def delete_account(body: DeleteIn, request: Request, response: Response, user: U
     uid = user.id
     audit(db, "account.delete", actor_id=uid, request=request)
     for d in db.scalars(select(MedicalDocument).where(MedicalDocument.user_id == uid)):
-        get_storage().delete(d.storage_key)
+        delete_file(d.storage_key)
     folder = get_settings().data_dir / "documents" / uid
     if folder.exists():
         shutil.rmtree(folder, ignore_errors=True)

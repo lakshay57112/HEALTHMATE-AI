@@ -92,3 +92,27 @@ def test_output_guardrails_remove_dose_changes_and_soften_diagnosis():
     text, ev = guardrails.check_output("You have diabetes. Increase your dose of metformin to 1000 mg. Your HbA1c is 7.4.", "en")
     assert "Increase your dose" not in text and "you have diabetes" not in text.lower()
     assert {e["guardrail"] for e in ev} == {"output_dose_change", "output_diagnosis"}
+
+
+def test_db_url_normalised_for_hosted_postgres():
+    from app.core.config import Settings
+
+    assert Settings(database_url="postgres://u:p@h:5432/d").database_url == "postgresql+psycopg://u:p@h:5432/d"
+    assert Settings(database_url="postgresql://u:p@h/d").database_url == "postgresql+psycopg://u:p@h/d"
+    assert Settings(database_url="postgresql+psycopg://u:p@h/d").database_url == "postgresql+psycopg://u:p@h/d"
+
+
+def test_db_storage_roundtrip_is_encrypted():
+    from sqlalchemy import select
+
+    from app.db.session import SessionLocal
+    from app.models import DocumentBlob
+    from app.services.storage import DbEncryptedStorage, delete_file, load_file
+
+    key, _ = DbEncryptedStorage().save("user-x", b"%PDF-1.4 secret medical text")
+    assert key.startswith("db:")
+    with SessionLocal() as db:
+        raw = db.scalar(select(DocumentBlob.data).where(DocumentBlob.key == key))
+    assert b"secret medical text" not in raw  # encrypted at rest
+    assert load_file(key) == b"%PDF-1.4 secret medical text"
+    delete_file(key)

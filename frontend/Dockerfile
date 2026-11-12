@@ -18,4 +18,5 @@ COPY --from=build /app/.next ./.next
 COPY --from=build /app/public ./public
 COPY --from=build /app/next.config.mjs ./
 EXPOSE 3000
-CMD ["npx", "next", "start", "-p", "3000"]
+ENV PORT=3000
+CMD ["npx", "next", "start"]

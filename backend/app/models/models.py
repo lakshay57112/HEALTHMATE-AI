@@ -11,6 +11,7 @@ from datetime import date, datetime, timezone
 from sqlalchemy import (
     JSON,
     Boolean,
+    LargeBinary,
     Date,
     DateTime,
     Float,
@@ -136,6 +137,14 @@ class MedicalDocument(TimestampMixin, Base):
     error: Mapped[str | None] = mapped_column(Text)
     verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     document_date: Mapped[date | None] = mapped_column(Date)
+
+
+class DocumentBlob(TimestampMixin, Base):
+    """Encrypted file bytes, used when STORAGE_BACKEND=db (hosts without persistent disks)."""
+
+    __tablename__ = "document_blobs"
+    key: Mapped[str] = mapped_column(String(255), primary_key=True)
+    data: Mapped[bytes] = mapped_column(LargeBinary)
 
 
 class DocumentChunk(TimestampMixin, Base):

@@ -1,8 +1,9 @@
 """Application settings. Every secret comes from the environment — nothing is hardcoded."""
+import os
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import Field
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 BASE_DIR = Path(__file__).resolve().parents[2]
@@ -28,7 +29,9 @@ class Settings(BaseSettings):
     # Encryption at rest (Fernet key, urlsafe base64 32 bytes). Generated into .data/ in dev if absent.
     encryption_key: str | None = None
 
-    # Storage
+    # Storage: "local" = encrypted files on disk; "db" = encrypted blobs in Postgres (for hosts without
+    # persistent disks, e.g. Render's free tier)
+    storage_backend: str = "local"
     data_dir: Path = BASE_DIR / ".data"
     max_upload_mb: int = 15
 
@@ -60,6 +63,22 @@ class Settings(BaseSettings):
     # Agent harness
     agent_max_steps: int = 6
     agent_max_context_chars: int = 24000
+
+    @field_validator("database_url")
+    @classmethod
+    def normalise_db_url(cls, v: str) -> str:
+        """Hosting providers hand out postgres:// or postgresql:// URLs; SQLAlchemy needs the psycopg driver."""
+        for prefix in ("postgres://", "postgresql://"):
+            if v.startswith(prefix):
+                return "postgresql+psycopg://" + v[len(prefix):]
+        return v
+
+    @model_validator(mode="after")
+    def hosted_defaults(self):  # noqa: ANN201
+        external = os.environ.get("RENDER_EXTERNAL_URL")
+        if external and self.frontend_origin == "http://localhost:3000":
+            self.frontend_origin = external.rstrip("/")
+        return self
 
     @property
     def llm_enabled(self) -> bool:

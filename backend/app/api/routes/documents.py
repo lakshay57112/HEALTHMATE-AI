@@ -18,7 +18,7 @@ from app.services.audit import audit
 from app.services.consent import has_consent
 from app.services.extraction.commit import commit_document
 from app.services.extraction.pipeline import process_document
-from app.services.storage import get_storage
+from app.services.storage import delete_file, get_storage, load_file
 
 router = APIRouter(prefix="/documents", tags=["documents"])
 settings = get_settings()
@@ -124,7 +124,7 @@ def get_document(doc_id: str, user: User = Depends(require_patient), db: Session
 @router.get("/{doc_id}/file")
 def get_file(doc_id: str, request: Request, user: User = Depends(require_patient), db: Session = Depends(get_db)):
     doc = _owned(db, user, doc_id)
-    data = get_storage().load(doc.storage_key)
+    data = load_file(doc.storage_key)
     audit(db, "document.view_file", actor_id=user.id, resource_type="document", resource_id=doc.id, request=request, commit=True)
     return Response(content=data, media_type=doc.mime_type, headers={"Content-Disposition": f'inline; filename="{doc.filename}"', "Cache-Control": "private, no-store"})
 
@@ -137,7 +137,7 @@ def preview(doc_id: str, page: int = 1, user: User = Depends(require_patient), d
     from PIL import Image
 
     doc = _owned(db, user, doc_id)
-    data = get_storage().load(doc.storage_key)
+    data = load_file(doc.storage_key)
     if doc.mime_type == "application/pdf":
         import pypdfium2 as pdfium
 
@@ -201,7 +201,7 @@ def reject(doc_id: str, request: Request, user: User = Depends(require_patient),
 @router.delete("/{doc_id}")
 def delete_document(doc_id: str, request: Request, user: User = Depends(require_patient), db: Session = Depends(get_db)):
     doc = _owned(db, user, doc_id)
-    get_storage().delete(doc.storage_key)
+    delete_file(doc.storage_key)
     db.query(DocumentChunk).filter(DocumentChunk.document_id == doc.id).delete()
     db.delete(doc)
     audit(db, "document.delete", actor_id=user.id, resource_type="document", resource_id=doc_id, request=request)

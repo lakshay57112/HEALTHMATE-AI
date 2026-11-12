@@ -80,6 +80,20 @@ npm run dev                          # http://localhost:3000
 
 **Enable background push:** `python backend/scripts/generate_vapid_keys.py` → paste into `.env` → restart → Settings → Enable notifications.
 
+## Deploy on Render
+
+The repo includes a Render Blueprint (`render.yaml`) and a single-container `Dockerfile` (Next.js on the public port, FastAPI on an internal port), so it fits on one free web service.
+
+1. Render Dashboard → **New → Blueprint** → select this repository → **Apply**.
+2. It creates a free Postgres database and the `healthmate-ai` web service (Singapore region). Leave `GEMINI_API_KEY` / `OPENAI_API_KEY` empty for demo mode, or add one and set `LLM_PROVIDER` to `gemini`/`openai`.
+3. The first build takes ~10 minutes. Open the service URL → **Try the demo**.
+
+Free-tier notes:
+- The service sleeps after 15 minutes without traffic and takes about a minute to wake. While asleep, the reminder engine doesn't run (upgrade the service to a paid instance for always-on reminders).
+- Free Render Postgres databases expire 30 days after creation; upgrade the database to keep data.
+- Uploaded documents are stored encrypted in Postgres (`STORAGE_BACKEND=db`) because free instances have no persistent disk.
+- Keep `ENCRYPTION_KEY` unchanged once set — it's needed to read stored documents.
+
 ## Project layout
 
 ```
@@ -105,6 +119,7 @@ frontend/src/
   components/            design system (ui/), app shell, charts, upload, verification editors, food art…
   lib/                   api client (+SSE), auth, i18n (EN/HI), voice (TTS/STT), push
 e2e/journeys.py          Playwright browser journeys
+Dockerfile, start.sh     single-container image (used by render.yaml)
 docs/                    API, architecture, agentic AI design, testing
 ```
 

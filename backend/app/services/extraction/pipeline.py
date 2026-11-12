@@ -27,7 +27,7 @@ from app.services.extraction.validator import validate
 from app.services.llm import LLMError, get_llm
 from app.services.medical_knowledge import scan_injection
 from app.services.observability import Tracer
-from app.services.storage import get_storage
+from app.services.storage import load_file
 
 log = logging.getLogger(__name__)
 
@@ -47,7 +47,7 @@ Node = Callable[[Session, State, Tracer], State]
 
 def node_intake(db: Session, st: State, tr: Tracer) -> State:
     doc: MedicalDocument = st["doc"]
-    st["data"] = get_storage().load(doc.storage_key)
+    st["data"] = load_file(doc.storage_key)
     return {"detail": f"{doc.mime_type}, {round(doc.size_bytes / 1024)} KB"}
 
 

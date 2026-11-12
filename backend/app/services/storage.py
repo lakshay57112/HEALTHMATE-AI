@@ -1,6 +1,7 @@
-"""Protected document storage: files are encrypted with Fernet before touching disk.
+"""Protected document storage: files are encrypted with Fernet before they are stored.
 
-Swap `LocalEncryptedStorage` for an S3/GCS implementation with server-side encryption in production.
+Backends: local disk (default) or Postgres (STORAGE_BACKEND=db, for hosts without persistent disks).
+Swap in an S3/GCS implementation with server-side encryption for larger deployments.
 """
 from __future__ import annotations
 
@@ -38,5 +39,50 @@ class LocalEncryptedStorage:
             path.unlink()
 
 
-def get_storage() -> LocalEncryptedStorage:
+class DbEncryptedStorage:
+    """Stores encrypted bytes in the document_blobs table (own session, so it works from background tasks too)."""
+
+    def save(self, user_id: str, data: bytes) -> tuple[str, str]:
+        from app.db.session import SessionLocal
+        from app.models import DocumentBlob
+
+        sha = hashlib.sha256(data).hexdigest()
+        key = f"db:{user_id}/{uuid.uuid4().hex}"
+        with SessionLocal() as db:
+            db.add(DocumentBlob(key=key, data=encrypt_bytes(data)))
+            db.commit()
+        return key, sha
+
+    def load(self, key: str) -> bytes:
+        from app.db.session import SessionLocal
+        from app.models import DocumentBlob
+
+        with SessionLocal() as db:
+            blob = db.get(DocumentBlob, key)
+            if not blob:
+                raise FileNotFoundError(key)
+            return decrypt_bytes(blob.data)
+
+    def delete(self, key: str) -> None:
+        from app.db.session import SessionLocal
+        from app.models import DocumentBlob
+
+        with SessionLocal() as db:
+            blob = db.get(DocumentBlob, key)
+            if blob:
+                db.delete(blob)
+                db.commit()
+
+
+def get_storage(key: str | None = None) -> LocalEncryptedStorage | DbEncryptedStorage:
+    if (key and key.startswith("db:")) or (key is None and get_settings().storage_backend == "db"):
+        return DbEncryptedStorage()
     return LocalEncryptedStorage(get_settings().data_dir / "documents")
+
+
+def load_file(key: str) -> bytes:
+    return get_storage(key).load(key)
+
+
+def delete_file(key: str) -> None:
+    get_storage(key).delete(key)

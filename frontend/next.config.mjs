@@ -1,12 +1,10 @@
 /** @type {import('next').NextConfig} */
-const backend = process.env.BACKEND_URL || "http://127.0.0.1:8000";
+// /api/* is proxied at runtime by src/app/api/[...path]/route.ts (reads BACKEND_URL per request).
 const nextConfig = {
   reactStrictMode: true,
+  output: process.env.NEXT_OUTPUT === "standalone" ? "standalone" : undefined,
   compress: false, // keep Server-Sent Events from the assistant unbuffered
   poweredByHeader: false,
-  async rewrites() {
-    return [{ source: "/api/:path*", destination: `${backend}/api/:path*` }];
-  },
   async headers() {
     return [{
       source: "/(.*)",

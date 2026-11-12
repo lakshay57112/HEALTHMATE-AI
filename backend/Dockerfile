@@ -14,4 +14,4 @@ USER appuser
 EXPOSE 8000
 # Apply migrations, make sure the food catalog + demo data exist, then serve.
 # (Sample documents are committed in sample_docs/; regenerate with scripts/generate_samples.py.)
-CMD ["sh", "-c", "alembic upgrade head && python -m app.seed && uvicorn app.main:app --host 0.0.0.0 --port 8000 --proxy-headers"]
+CMD ["sh", "-c", "alembic upgrade head && python -m app.seed && uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000} --proxy-headers"]
