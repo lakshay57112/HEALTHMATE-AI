@@ -114,8 +114,12 @@ def prescription(path: Path) -> None:
 
 
 def prescription_photo(path: Path) -> None:
-    font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 30)
-    bold = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 36)
+    try:
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 30)
+        bold = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 36)
+    except OSError:  # Windows / macOS: fall back to Pillow's bundled font
+        font = ImageFont.load_default(size=30)
+        bold = ImageFont.load_default(size=36)
     img = Image.new("RGB", (1400, 1000), (250, 248, 240))
     d = ImageDraw.Draw(img)
     d.text((60, 40), "Sharma Family Clinic", font=bold, fill=(30, 60, 50))
