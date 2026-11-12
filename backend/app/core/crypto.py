@@ -1,0 +1,86 @@
+"""Field-level and file-level encryption at rest using Fernet (AES-128-CBC + HMAC-SHA256)."""
+from __future__ import annotations
+
+import json
+import logging
+from functools import lru_cache
+from typing import Any
+
+from cryptography.fernet import Fernet, InvalidToken
+from sqlalchemy import Text
+from sqlalchemy.types import TypeDecorator
+
+from app.core.config import get_settings
+
+log = logging.getLogger(__name__)
+
+
+@lru_cache
+def _fernet() -> Fernet:
+    settings = get_settings()
+    key = settings.encryption_key
+    if not key:
+        key_file = settings.data_dir / "dev_encryption.key"
+        if key_file.exists():
+            key = key_file.read_text().strip()
+        else:
+            key = Fernet.generate_key().decode()
+            key_file.write_text(key)
+            key_file.chmod(0o600)
+            log.warning("ENCRYPTION_KEY not set — generated a development key at %s", key_file)
+    return Fernet(key.encode() if isinstance(key, str) else key)
+
+
+def encrypt_bytes(data: bytes) -> bytes:
+    return _fernet().encrypt(data)
+
+
+def decrypt_bytes(token: bytes) -> bytes:
+    return _fernet().decrypt(token)
+
+
+def encrypt_str(value: str | None) -> str | None:
+    if value is None:
+        return None
+    return _fernet().encrypt(value.encode("utf-8")).decode("ascii")
+
+
+def decrypt_str(value: str | None) -> str | None:
+    if value is None:
+        return None
+    try:
+        return _fernet().decrypt(value.encode("ascii")).decode("utf-8")
+    except (InvalidToken, ValueError):
+        log.error("Failed to decrypt a field — wrong ENCRYPTION_KEY?")
+        return None
+
+
+class EncryptedText(TypeDecorator):
+    """Transparent encrypted text column."""
+
+    impl = Text
+    cache_ok = True
+
+    def process_bind_param(self, value: Any, dialect):  # noqa: ANN001
+        return encrypt_str(value) if value is not None else None
+
+    def process_result_value(self, value: Any, dialect):  # noqa: ANN001
+        return decrypt_str(value) if value is not None else None
+
+
+class EncryptedJSON(TypeDecorator):
+    """Transparent encrypted JSON column (stored as ciphertext text)."""
+
+    impl = Text
+    cache_ok = True
+
+    def process_bind_param(self, value: Any, dialect):  # noqa: ANN001
+        if value is None:
+            return None
+        return encrypt_str(json.dumps(value, default=str, ensure_ascii=False))
+
+    def process_result_value(self, value: Any, dialect):  # noqa: ANN001
+        if value is None:
+            return None
+        raw = decrypt_str(value)
+        return json.loads(raw) if raw else None
