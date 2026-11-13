@@ -119,7 +119,10 @@ function VerifyView({ doc, onReload, onDone, router, lang }: { doc: any; onReloa
   const highCount = docFlags.filter((f) => f.severity === "high").length + (review.items || []).reduce((n: number, i: any) => n + i.flags.filter((f: Flag) => f.severity === "high").length, 0);
   const injection = docFlags.some((f) => f.code === "possible_injection");
 
-  const missingSlots = useMemo(() => type === "prescription" && (form.medicines || []).some((m: any) => m.include !== false && !parseFrequency(m.frequency).asNeeded && (m.slots ?? parseFrequency(m.frequency).slots).length === 0), [form, type]);
+  const missingSlotNames: string[] = useMemo(() => (type === "prescription" ? (form.medicines || []) : [])
+    .filter((m: any) => m.include !== false && !parseFrequency(m.frequency).asNeeded && (m.slots ?? parseFrequency(m.frequency).slots).length === 0)
+    .map((m: any) => m.name || "a medicine"), [form, type]);
+  const missingSlots = missingSlotNames.length > 0;
 
   const changeType = async (t: string) => {
     if (t === type) return;
@@ -203,7 +206,7 @@ function VerifyView({ doc, onReload, onDone, router, lang }: { doc: any; onReloa
               <Checkbox checked={ack} onCheckedChange={(v) => setAck(!!v)} className="mt-0.5" />
               <span>I have checked this information against my document.{type === "prescription" && " If anything is unclear, I will confirm with my pharmacist or doctor."}</span>
             </label>
-            {missingSlots && <p className="mt-2 text-sm text-danger-ink">Choose when to take each ticked medicine before saving.</p>}
+            {missingSlots && <p className="mt-2 text-sm text-danger-ink">Choose when to take {missingSlotNames.join(", ")} (or untick {missingSlotNames.length > 1 ? "them" : "it"}) before saving.</p>}
             <div className="mt-4 flex flex-col-reverse gap-2 sm:flex-row sm:justify-between">
               <Button variant="ghost" onClick={reject}><Trash2 /> Discard</Button>
               <Button size="lg" className="h-12" disabled={!ack || missingSlots} loading={busy} onClick={confirmSave}><Check /> Confirm and save</Button>

@@ -1,5 +1,6 @@
 "use client";
-import { AlertTriangle, CircleAlert, Info, Plus, Trash2 } from "lucide-react";
+import { useState } from "react";
+import { AlertTriangle, CircleAlert, CircleCheck, Info, Plus, Trash2 } from "lucide-react";
 import { StatusPill } from "@/components/common";
 import { SLOT_ICONS } from "@/components/medicine";
 import { Button } from "@/components/ui/button";
@@ -35,10 +36,13 @@ const FREQ: Record<string, string[]> = {
   od: ["morning"], qd: ["morning"], "once daily": ["morning"], bd: ["morning", "night"], bid: ["morning", "night"], "twice daily": ["morning", "night"],
   tds: ["morning", "afternoon", "night"], tid: ["morning", "afternoon", "night"], qid: ["morning", "afternoon", "evening", "night"], hs: ["night"], "at bedtime": ["night"],
 };
-export function parseFrequency(f?: string | null): { slots: string[]; asNeeded: boolean; recognized: boolean } {
+const NON_DAILY = /\b(once a week|once weekly|weekly|every week|once in a week|alternate days?|every other day|once a month|monthly|hafte mein ek baar)\b/;
+export function parseFrequency(f?: string | null): { slots: string[]; asNeeded: boolean; recognized: boolean; nonDaily?: boolean } {
   if (!f) return { slots: [], asNeeded: false, recognized: false };
   const s = f.trim().toLowerCase();
   if (/(sos|prn|as needed|when required|if needed)/.test(s)) return { slots: [], asNeeded: true, recognized: true };
+  // weekly / alternate-day doses: only daily reminders exist, so these are saved without one (never as a daily schedule)
+  if (NON_DAILY.test(s)) return { slots: [], asNeeded: true, recognized: true, nonDaily: true };
   const m = s.match(/^([01½])\s*-\s*([01½])\s*-\s*([01½])(?:\s*-\s*([01½]))?$/);
   if (m) {
     const parts = m.slice(1).filter((x) => x !== undefined);
@@ -124,11 +128,92 @@ export function LabEditor({ data, setData, items }: { data: any; setData: (d: an
 
 /* ---------- Prescription ---------- */
 const SLOTS = ["morning", "afternoon", "evening", "night"] as const;
+
+type Gap = { text: string; level: "required" | "check" | "info" };
+// Server flags already covered by the live checks below (those update as the patient edits; flags don't).
+const COVERED = new Set(["unclear_frequency", "missing_frequency", "missing_dosage", "missing_strength", "missing_duration", "as_needed", "non_daily"]);
+
+/** What the paper didn't say for one medicine. Live: recomputed as the patient fills things in. */
+export function medicineGaps(m: any, rev?: ItemReview): Gap[] {
+  const gaps: Gap[] = [];
+  const fp = parseFrequency(m.frequency);
+  const slots: string[] = m.slots ?? fp.slots;
+  if (fp.nonDaily) gaps.push({ level: "check", text: `Taken ${m.frequency?.toLowerCase()}, not daily — no daily reminder will be set` });
+  else if (fp.asNeeded) gaps.push({ level: "check", text: "No time written — it says SOS (only when needed), so no reminder will be set" });
+  else if (!slots.length) gaps.push({ level: "required", text: m.frequency ? `Timing "${m.frequency}" isn't clear — choose when to take it` : "When to take it isn't written" });
+  if (!m.dosage) gaps.push({ level: "check", text: "Dose each time isn't written (e.g. 1 tablet)" });
+  if (!m.strength) gaps.push({ level: "check", text: "Strength isn't written (e.g. 500 mg)" });
+  for (const f of rev?.flags || []) {
+    if (!COVERED.has(f.code) && f.severity !== "info") gaps.push({ level: f.severity === "high" ? "required" : "check", text: f.message });
+  }
+  if (m.duration_days == null && !fp.asNeeded) gaps.push({ level: "info", text: "Number of days isn't written" });
+  if (!m.meal_relation || m.meal_relation === "any") gaps.push({ level: "info", text: "Before or after food isn't written" });
+  return gaps;
+}
+
+function MissingInfoSummary({ medicines, items, onReview }: { medicines: any[]; items: ItemReview[]; onReview: (i: number) => void }) {
+  const rows = medicines
+    .map((m, i) => ({ i, m, gaps: m.include === false ? [] : medicineGaps(m, items.find((x) => x.index === i)) }))
+    .filter((r) => r.gaps.length);
+  const serious = rows.filter((r) => r.gaps.some((g) => g.level !== "info"));
+  const minorOnly = rows.filter((r) => r.gaps.every((g) => g.level === "info"));
+  const included = medicines.filter((m) => m.include !== false).length;
+  if (!included) return null;
+  if (!serious.length) {
+    return (
+      <div className="flex items-start gap-3 rounded-2xl bg-primary-50 px-4 py-3 text-[0.9rem] text-primary-800">
+        <CircleCheck className="mt-0.5 h-5 w-5 shrink-0" />
+        <div><b>Every medicine has a time, dose and strength.</b> Still compare each one with your paper before saving.
+          {minorOnly.length > 0 && <span className="text-primary-800/80"> Days or food timing aren&apos;t written for {minorOnly.length} medicine{minorOnly.length > 1 ? "s" : ""}.</span>}</div>
+      </div>
+    );
+  }
+  const required = serious.filter((r) => r.gaps.some((g) => g.level === "required")).length;
+  return (
+    <section aria-labelledby="missing-title" className="rounded-2xl border border-warning/40 bg-warning-bg/50 p-4">
+      <div className="flex items-start gap-3">
+        <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-warning-ink" />
+        <div className="min-w-0 flex-1">
+          <h3 id="missing-title" className="font-semibold text-ink">{serious.length} of {included} medicines are missing details</h3>
+          <p className="mt-0.5 text-[0.85rem] text-ink-soft">
+            {required ? "Items in red must be fixed (or the medicine unticked) before saving. " : ""}Ask your doctor or pharmacist for anything not written on the prescription — please don&apos;t guess.
+          </p>
+          <ul className="mt-3 divide-y divide-warning/20 overflow-hidden rounded-xl bg-surface">
+            {serious.map(({ i, m, gaps }) => (
+              <li key={i} className="flex items-start gap-3 px-3 py-2.5">
+                <div className="min-w-0 flex-1">
+                  <div className="font-semibold text-ink">{m.name || `Medicine ${i + 1}`}</div>
+                  <ul className="mt-1 space-y-0.5">
+                    {gaps.filter((g) => g.level !== "info").map((g, k) => (
+                      <li key={k} className={cn("flex items-start gap-1.5 text-[0.85rem]", g.level === "required" ? "text-danger-ink" : "text-warning-ink")}>
+                        {g.level === "required" ? <CircleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" /> : <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />}
+                        <span>{g.text}</span>
+                      </li>
+                    ))}
+                    {gaps.some((g) => g.level === "info") && <li className="text-[0.8rem] text-muted">Also not written: {gaps.filter((g) => g.level === "info").map((g) => g.text.replace(" isn't written", "").toLowerCase()).join(", ")}</li>}
+                  </ul>
+                </div>
+                <Button variant="outline" size="sm" onClick={() => onReview(i)}>Review</Button>
+              </li>
+            ))}
+          </ul>
+        </div>
+      </div>
+    </section>
+  );
+}
 export function PrescriptionEditor({ data, setData, items, duplicates, options, setOptions }: { data: any; setData: (d: any) => void; items: ItemReview[]; duplicates: any[]; options: any; setOptions: (o: any) => void }) {
   const { lang, t } = useI18n();
   const upd = (i: number, patch: any) => setData({ ...data, medicines: data.medicines.map((m: any, j: number) => (j === i ? { ...m, ...patch } : m)) });
+  const [focus, setFocus] = useState<number | null>(null);
+  const review = (i: number) => {
+    setFocus(i);
+    document.getElementById(`med-${i}`)?.scrollIntoView({ behavior: "smooth", block: "center" });
+    window.setTimeout(() => setFocus((f) => (f === i ? null : f)), 2500);
+  };
   return (
     <div className="space-y-5">
+      <MissingInfoSummary medicines={data.medicines} items={items} onReview={review} />
       <div className="grid gap-4 sm:grid-cols-3">
         <Field label="Doctor"><Input value={data.doctor_name || ""} onChange={(e) => setData({ ...data, doctor_name: e.target.value })} /></Field>
         <Field label="Clinic / hospital"><Input value={data.clinic || ""} onChange={(e) => setData({ ...data, clinic: e.target.value })} /></Field>
@@ -142,8 +227,9 @@ export function PrescriptionEditor({ data, setData, items, duplicates, options, 
           const slots: string[] = m.slots ?? fp.slots;
           const included = m.include !== false;
           const needsSlots = included && !fp.asNeeded && slots.length === 0;
+          const gaps = included ? medicineGaps(m, rev).filter((g) => g.level !== "info") : [];
           return (
-            <div key={i} className={cn("rounded-2xl border bg-surface p-4 transition-opacity", needsSlots ? "border-danger/50" : "border-line", !included && "opacity-55")}>
+            <div key={i} id={`med-${i}`} className={cn("scroll-mt-24 rounded-2xl border bg-surface p-4 transition-[opacity,box-shadow]", needsSlots ? "border-danger/50" : "border-line", !included && "opacity-55", focus === i && "ring-4 ring-warning/50")}>
               <div className="flex items-start gap-3">
                 <Checkbox checked={included} onCheckedChange={(v) => upd(i, { include: !!v })} aria-label={`Include ${m.name}`} className="mt-3" />
                 <div className="min-w-0 flex-1 space-y-3">
@@ -152,6 +238,11 @@ export function PrescriptionEditor({ data, setData, items, duplicates, options, 
                     {m.generic_name && m.generic_name !== m.name && <Badge variant="outline">{m.generic_name}{m.generic_source === "dictionary" ? " (from brand)" : ""}</Badge>}
                     {m.form && <Badge>{m.form}</Badge>}
                     {rev && <ConfidenceChip value={rev.confidence} />}
+                    {gaps.length > 0 && (
+                      <span className={cn("inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[0.72rem] font-semibold", gaps.some((g) => g.level === "required") ? "bg-danger-bg text-danger-ink" : "bg-warning-bg text-warning-ink")}>
+                        <AlertTriangle className="h-3 w-3" /> {gaps.length} missing
+                      </span>
+                    )}
                   </div>
                   <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
                     <Field label="Strength"><Input value={m.strength || ""} onChange={(e) => upd(i, { strength: e.target.value })} placeholder="e.g. 500mg" /></Field>
@@ -165,7 +256,7 @@ export function PrescriptionEditor({ data, setData, items, duplicates, options, 
                         {Object.entries(MEAL_REL).map(([k, v]) => <option key={k} value={k}>{v[lang]}</option>)}
                       </NativeSelect>
                     </Field>
-                    <Field label={fp.asNeeded ? "Only when needed — no fixed reminder" : "When to take"} error={needsSlots ? "Choose the times written on your prescription (or untick this medicine)." : null}>
+                    <Field label={fp.nonDaily ? "Not daily — no automatic reminder" : fp.asNeeded ? "Only when needed — no fixed reminder" : "When to take"} error={needsSlots ? "Choose the times written on your prescription (or untick this medicine)." : null}>
                       <div className="flex flex-wrap gap-2">
                         {SLOTS.map((s) => {
                           const Icon = SLOT_ICONS[s];

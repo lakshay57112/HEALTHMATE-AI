@@ -2,7 +2,7 @@
 import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
 import { useMemo, useState } from "react";
-import { ArrowDownRight, ArrowUpRight, HelpCircle, Minus, Sparkles, Trash2, Volume2 } from "lucide-react";
+import { ArrowDownRight, ArrowUpRight, HelpCircle, Minus, Sparkles, Square, Trash2, Volume2 } from "lucide-react";
 import { toast } from "sonner";
 import { ParameterTrend } from "@/components/charts";
 import { Disclaimer, ErrorState, PageHeader, SampleBadge, StatusPill } from "@/components/common";
@@ -11,7 +11,24 @@ import { Card, CardContent, CardHeader, CardTitle, Segmented, Skeleton } from "@
 import { api, useApi } from "@/lib/api";
 import { useI18n } from "@/lib/i18n";
 import { cn, fmtDate } from "@/lib/utils";
-import { speak } from "@/lib/voice";
+import { speak, stopSpeaking, useSpeaking } from "@/lib/voice";
+
+/** What the speaker button says: the headline plus the three furthest-out values — not every finding. */
+function spokenSummary(r: any, s: any, lang: "en" | "hi") {
+  const hi = lang === "hi";
+  const off = (p: any) => (p.status === "high" && p.ref_high ? p.value / p.ref_high : p.status === "low" && p.value ? (p.ref_low || 0) / p.value : 1);
+  const abnormal = r.parameters.filter((p: any) => p.status === "high" || p.status === "low").sort((a: any, b: any) => off(b) - off(a));
+  const label = (p: any) => r.explanations?.[p.id]?.[lang]?.label || p.name;
+  const dir = (p: any) => (hi ? (p.status === "high" ? "ज़्यादा" : "कम") : p.status);
+  const top = abnormal.slice(0, 3).map((p: any) => `${label(p)} ${dir(p)}`);
+  const more = abnormal.length - top.length;
+  const parts = [s.headline || ""];
+  if (top.length) {
+    parts.push(hi ? `मुख्य: ${top.join(", ")}${more > 0 ? `, और ${more} अन्य` : ""}।` : `The main ones: ${top.join(", ")}${more > 0 ? `, plus ${more} more` : ""}.`);
+    parts.push(hi ? "पूरी जानकारी स्क्रीन पर है। कृपया अपने डॉक्टर से बात करें।" : "The details are on your screen. Please discuss them with your doctor.");
+  }
+  return parts.join(" ");
+}
 
 function RangeBar({ p }: { p: any }) {
   if (p.value == null || (p.ref_low == null && p.ref_high == null)) return <div className="h-1.5 w-full rounded-full bg-muted-bg" />;
@@ -39,6 +56,7 @@ export default function ReportDetail() {
   const [lang, setLang] = useState<"en" | "hi">(uiLang);
   const [sel, setSel] = useState<string | null>(null);
   const { data, error, loading, reload } = useApi<{ report: any }>(`/reports/${id}`);
+  const speaking = useSpeaking();
   const r = data?.report;
   const hist = useApi<any>(r && (sel || r.parameters.find((p: any) => p.status !== "normal")?.canonical_name || r.parameters[0]?.canonical_name)
     ? `/reports/parameters/${sel || r.parameters.find((p: any) => p.status !== "normal")?.canonical_name || r.parameters[0]?.canonical_name}/history` : null, [sel, r?.id]);
@@ -62,7 +80,9 @@ export default function ReportDetail() {
       <PageHeader back="/app/reports" eyebrow={<span className="flex items-center gap-2">{fmtDate(r.report_date)} · {r.lab_name || "Laboratory"} {r.is_sample && <SampleBadge />}</span>} title={r.title}
         actions={<>
           <Segmented value={lang} onChange={setLang} options={[{ value: "en", label: "English" }, { value: "hi", label: "हिंदी" }]} />
-          <Button variant="outline" onClick={() => speak([s.headline, ...(s.findings || []).map((f: any) => f.text)].join(" "), { voice_language: lang === "hi" ? "hi-IN" : "en-IN" })} aria-label="Read aloud"><Volume2 /></Button>
+          {speaking
+            ? <Button variant="outline" onClick={stopSpeaking}><Square className="fill-current" /> {lang === "hi" ? "रोकें" : "Stop"}</Button>
+            : <Button variant="outline" onClick={() => speak(spokenSummary(r, s, lang), { voice_language: lang === "hi" ? "hi-IN" : "en-IN" })}><Volume2 /> {lang === "hi" ? "सुनें" : "Listen"}</Button>}
           <Button asChild variant="secondary"><Link href={`/app/assistant?q=${encodeURIComponent(lang === "hi" ? "मेरी नवीनतम रिपोर्ट हिंदी में समझाइए" : "Explain my latest blood report")}`}><Sparkles /> Ask about this</Link></Button>
         </>} />
 

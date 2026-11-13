@@ -3,7 +3,7 @@ import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { Suspense, useEffect, useRef, useState } from "react";
 import {
-  Bot, CalendarClock, Check, ChevronDown, FileText, History, Loader2, Mic, MicOff, Plus, Send, ShieldAlert, ShieldCheck, Siren, Sparkles, Trash2, Volume2, Wrench, X,
+  Bot, CalendarClock, Check, ChevronDown, FileText, History, Loader2, Mic, MicOff, Plus, Send, ShieldAlert, ShieldCheck, Siren, Sparkles, Square, Trash2, Volume2, Wrench, X,
 } from "lucide-react";
 import { toast } from "sonner";
 import { ParameterTrend } from "@/components/charts";
@@ -13,7 +13,7 @@ import { Badge, Card } from "@/components/ui/primitives";
 import { api, streamChat, useApi, type AgentEvent } from "@/lib/api";
 import { useI18n } from "@/lib/i18n";
 import { cn, fmtTime } from "@/lib/utils";
-import { recognitionSupported, speak, startRecognition } from "@/lib/voice";
+import { recognitionSupported, shortForSpeech, speak, startRecognition, stopSpeaking, useSpeaking } from "@/lib/voice";
 
 type ToolRun = { id: string; name: string; args?: string; ok?: boolean; untrusted?: boolean; done?: boolean };
 type Msg = { id: string; role: "user" | "assistant"; content: string; tools?: ToolRun[]; cards?: any[]; guardrails?: any[]; citations?: any[]; proposals?: any[]; mode?: string; streaming?: boolean; error?: string };
@@ -106,6 +106,8 @@ function AssistantInner() {
   const sessions = useApi<{ items: any[] }>("/assistant/sessions");
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [msgs, setMsgs] = useState<Msg[]>([]);
+  const speaking = useSpeaking();
+  const [readingId, setReadingId] = useState<string | null>(null);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
   const [listening, setListening] = useState(false);
@@ -247,8 +249,9 @@ function AssistantInner() {
                   <ul className="mt-1.5 space-y-1">{m.citations.map((c, i) => <li key={i} className="flex items-center gap-1.5">{c.flagged ? <ShieldAlert className="h-3.5 w-3.5 text-danger" /> : <FileText className="h-3.5 w-3.5" />}{c.document_id ? <Link href={`/app/documents/${c.document_id}`} className="hover:underline">{c.source}</Link> : c.source}{c.verified ? " · verified" : " · unverified"}</li>)}</ul>
                 </details>
               )}
-              {!m.streaming && m.content && (
-                <button onClick={() => speak(m.content.replace(/ℹ️.*/s, ""), { voice_language: /[ऀ-ॿ]/.test(m.content) ? "hi-IN" : "en-IN" })} className="inline-flex items-center gap-1 text-[0.78rem] text-muted hover:text-ink"><Volume2 className="h-3.5 w-3.5" /> Read aloud</button>
+              {!m.streaming && m.content && (speaking && readingId === m.id
+                ? <button onClick={stopSpeaking} className="inline-flex items-center gap-1 text-[0.78rem] font-medium text-ink"><Square className="h-3 w-3 fill-current" /> Stop reading</button>
+                : <button onClick={() => { const hi = /[ऀ-ॿ]/.test(m.content); setReadingId(m.id); speak(shortForSpeech(m.content, 3, hi), { voice_language: hi ? "hi-IN" : "en-IN" }); }} className="inline-flex items-center gap-1 text-[0.78rem] text-muted hover:text-ink"><Volume2 className="h-3.5 w-3.5" /> Read aloud</button>
               )}
             </div>
           </div>

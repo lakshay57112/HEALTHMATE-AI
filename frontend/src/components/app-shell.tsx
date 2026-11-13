@@ -4,7 +4,7 @@ import { usePathname } from "next/navigation";
 import { useEffect, useState } from "react";
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import {
-  Bell, CalendarClock, FileText, History, House, Languages, LogOut, Menu, Pill, Plus, Salad, Settings, Sparkles, User as UserIcon, Users, X,
+  Bell, CalendarClock, FileText, History, House, Languages, LogOut, Menu, Pill, Plus, Salad, Settings, Sparkles, Square, User as UserIcon, Users, Volume2, X,
 } from "lucide-react";
 import { Logo } from "@/components/common";
 import { ReminderAgent } from "@/components/reminder-agent";
@@ -12,6 +12,7 @@ import { api } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import { useI18n } from "@/lib/i18n";
 import { cn, initials } from "@/lib/utils";
+import { stopSpeaking, useSpeaking } from "@/lib/voice";
 
 const NAV = [
   { href: "/app", label: "Overview", icon: House },
@@ -112,6 +113,23 @@ function UserMenu() {
   );
 }
 
+/** Floating control shown on every screen while something is being read aloud. */
+function StopSpeakingPill() {
+  const speaking = useSpeaking();
+  if (!speaking) return null;
+  return (
+    <div className="fixed inset-x-0 bottom-24 z-50 flex justify-center px-4 lg:bottom-6 lg:ml-[264px]" role="status" aria-live="polite">
+      <div className="flex items-center gap-3 rounded-full bg-ink py-1.5 pl-4 pr-1.5 text-sm text-white shadow-lift animate-fade-up">
+        <Volume2 className="h-4 w-4 animate-pulse" aria-hidden />
+        <span>Reading aloud…</span>
+        <button onClick={stopSpeaking} className="inline-flex h-9 items-center gap-1.5 rounded-full bg-white px-3.5 font-medium text-ink hover:bg-white/90">
+          <Square className="h-3.5 w-3.5 fill-current" /> Stop
+        </button>
+      </div>
+    </div>
+  );
+}
+
 export function AppShell({ children }: { children: React.ReactNode }) {
   const path = usePathname();
   const { t } = useI18n();
@@ -119,7 +137,18 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   const [moreOpen, setMoreOpen] = useState(false);
   useEffect(() => {
     setMoreOpen(false);
+    stopSpeaking(); // leaving a screen stops anything it was reading aloud
   }, [path]);
+  useEffect(() => {
+    const stop = () => {
+      stopSpeaking();
+    };
+    window.addEventListener("pagehide", stop);
+    return () => {
+      window.removeEventListener("pagehide", stop);
+      stopSpeaking();
+    };
+  }, []);
 
   return (
     <div className="min-h-screen">
@@ -172,6 +201,8 @@ export function AppShell({ children }: { children: React.ReactNode }) {
       <main className="lg:ml-[264px]">
         <div className="mx-auto max-w-6xl px-4 pb-28 pt-6 sm:px-6 lg:pb-12 lg:pt-8">{children}</div>
       </main>
+
+      <StopSpeakingPill />
 
       {/* Mobile bottom navigation */}
       <nav className="fixed inset-x-0 bottom-0 z-30 border-t border-line bg-surface/95 pb-[env(safe-area-inset-bottom)] backdrop-blur lg:hidden" aria-label="Mobile">
