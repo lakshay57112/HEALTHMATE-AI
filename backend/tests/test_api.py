@@ -41,16 +41,18 @@ def test_prescription_journey_creates_schedule_only_after_verification(client):
     data = doc["extraction"]["data"]
     names = [m["name"] for m in data["medicines"]]
     assert "Glycomet" in names
-    # Unclear weekly medicine must be unticked or given explicit slots
-    bad = client.post(f"/api/documents/{doc_id}/confirm", json={"type": "prescription", "data": data, "options": {}})
+    # A medicine with no readable timing must be unticked or given explicit slots
+    unclear = json.loads(json.dumps(data))
+    unclear["medicines"][0]["frequency"] = None
+    bad = client.post(f"/api/documents/{doc_id}/confirm", json={"type": "prescription", "data": unclear, "options": {}})
     assert bad.status_code == 422
-    for i, m in enumerate(data["medicines"]):
-        m["include"] = m["frequency"] is not None
     ok = client.post(f"/api/documents/{doc_id}/confirm", json={"type": "prescription", "data": data, "options": {"create_follow_up": True}})
     assert ok.status_code == 200, ok.text
-    assert ok.json()["result"]["created"]["medicines"] == 3
+    assert ok.json()["result"]["created"]["medicines"] == 4
     meds = client.get("/api/medicines").json()["items"]
-    assert len(meds) == 3 and all(m["verified"] for m in meds)
+    assert len(meds) == 4 and all(m["verified"] for m in meds)
+    weekly = next(m for m in meds if m["name"] == "Uprise D3")
+    assert weekly["as_needed"] and not weekly["schedules"]  # once weekly → no daily reminder
     glycomet = next(m for m in meds if m["name"] == "Glycomet")
     assert {s["slot"] for s in glycomet["schedules"]} == {"morning", "night"}
     assert glycomet["dosage"] == "1 tablet"  # never modified

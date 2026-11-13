@@ -54,6 +54,9 @@ _FREQ_TABLE: dict[str, list[str]] = {
     "om": ["morning"], "in the morning": ["morning"],
 }
 _AS_NEEDED = {"sos", "prn", "as needed", "when required", "if needed"}
+# Weekly / alternate-day / monthly doses. Only daily reminders exist, so these are saved without automatic
+# reminders (like "when needed") rather than being turned into a daily schedule by mistake.
+_NON_DAILY = re.compile(r"\b(once a week|once weekly|weekly|every week|once in a week|alternate days?|every other day|once a month|monthly|hafte mein ek baar)\b")
 
 
 @dataclass
@@ -62,6 +65,7 @@ class FrequencyParse:
     as_needed: bool
     recognized: bool
     note: str = ""
+    non_daily: bool = False
 
 
 def parse_frequency(freq: str | None) -> FrequencyParse:
@@ -70,6 +74,8 @@ def parse_frequency(freq: str | None) -> FrequencyParse:
     f = freq.strip().lower()
     if any(k in f for k in _AS_NEEDED):
         return FrequencyParse([], True, True, "Take only when needed — no fixed reminder")
+    if _NON_DAILY.search(f):
+        return FrequencyParse([], True, True, "Not taken every day — saved without daily reminders", non_daily=True)
     m = re.fullmatch(r"\s*([01½])\s*-\s*([01½])\s*-\s*([01½])(?:\s*-\s*([01½]))?\s*", f)
     if m:
         parts = [p for p in m.groups() if p is not None]

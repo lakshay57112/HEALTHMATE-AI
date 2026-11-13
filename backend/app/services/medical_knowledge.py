@@ -12,7 +12,7 @@ import re
 # canonical -> aliases (lowercase, punctuation-insensitive)
 ALIASES: dict[str, list[str]] = {
     "hemoglobin": ["haemoglobin", "hemoglobin", "hb", "hgb"],
-    "hba1c": ["hba1c", "glycated haemoglobin", "glycated hemoglobin", "glycosylated hemoglobin", "a1c"],
+    "hba1c": ["hba1c", "hbalc", "glycated haemoglobin", "glycated hemoglobin", "glycosylated hemoglobin", "a1c"],
     "fasting_glucose": ["fasting blood sugar", "fasting blood glucose", "fbs", "glucose fasting", "fasting plasma glucose", "blood sugar fasting"],
     "pp_glucose": ["post prandial blood sugar", "postprandial blood sugar", "ppbs", "glucose pp", "post prandial glucose", "blood sugar pp"],
     "random_glucose": ["random blood sugar", "rbs", "glucose random"],
@@ -20,6 +20,8 @@ ALIASES: dict[str, list[str]] = {
     "ldl": ["ldl cholesterol", "ldl", "ldl-c", "low density lipoprotein"],
     "hdl": ["hdl cholesterol", "hdl", "hdl-c", "high density lipoprotein"],
     "triglycerides": ["triglycerides", "triglyceride", "tg"],
+    "vldl": ["vldl cholesterol", "vldl"],
+    "non_hdl": ["non hdl cholesterol", "non-hdl cholesterol", "non hdl"],
     "creatinine": ["serum creatinine", "creatinine"],
     "urea": ["blood urea", "urea", "bun", "blood urea nitrogen"],
     "egfr": ["egfr", "estimated gfr"],
@@ -43,6 +45,10 @@ _ALIAS_INDEX = sorted(((a, c) for c, al in ALIASES.items() for a in al), key=lam
 def canonicalize(name: str) -> str:
     n = re.sub(r"[^a-z0-9 ]+", " ", name.lower()).strip()
     n = re.sub(r"\s+", " ", n)
+    # Ratios ("Cholesterol/HDL Ratio") and urine tests ("Urine Albumin/Creatinine") are different analytes from
+    # the serum test whose name they contain — matching them would apply the wrong plausibility limits.
+    if re.search(r"\b(ratio|index)\b", n) or re.match(r"(urine|urinary|spot urine|24 ?hr urine)\b", n):
+        return re.sub(r"\s+", "_", n)[:60] or "unknown"
     for alias, canon in _ALIAS_INDEX:
         a = re.sub(r"[^a-z0-9 ]+", " ", alias)
         if n == a or n.startswith(a + " ") or f" {a} " in f" {n} " and len(a) > 3:
@@ -164,7 +170,14 @@ INJECTION_PATTERNS = [
     r"you are now", r"system prompt", r"developer mode", r"act as (an? )?(admin|doctor|system)",
     r"(send|email|forward|post) (this|the|all|my) .{0,40}(to|at) ", r"https?://", r"\bprescribe\b.{0,30}\bincrease\b",
     r"new instructions?:", r"override (the )?(safety|rules|instructions)", r"<\s*/?\s*(system|instructions?)\s*>",
+    r"\btell the (patient|user)\b", r"\bdo not (mention|reveal|disclose) (this|these|the instructions)",
+    r"\bmark (every|all) .{0,25}\bnormal\b", r"\b(ai|assistant|chatbot|language model)\b.{0,20}\b(must|should) (now )?(ignore|obey|follow)",
 ]
+
+
+def strip_injection_lines(text: str) -> str:
+    """Drop lines that look like instructions to an AI, so they can never become extracted data."""
+    return "\n".join(ln for ln in (text or "").splitlines() if not scan_injection(ln))
 
 
 def scan_injection(text: str) -> list[str]:

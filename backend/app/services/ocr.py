@@ -37,6 +37,9 @@ def _tesseract_available() -> bool:
     return shutil.which("tesseract") is not None
 
 
+LOW_CONFIDENCE = 0.75
+
+
 def _preprocess(img):  # noqa: ANN001
     from PIL import ImageOps
 
@@ -48,19 +51,85 @@ def _preprocess(img):  # noqa: ANN001
     return ImageOps.autocontrast(img)
 
 
-def _ocr_image(img) -> tuple[str, float | None]:  # noqa: ANN001
+def _deskew_angle(img) -> float:  # noqa: ANN001
+    """Angle (degrees) that makes text lines horizontal: maximise the variance of row ink sums."""
+    from PIL import Image
+
+    small = img.copy()
+    small.thumbnail((900, 900))
+    ink = small.point(lambda v: 255 if v < 140 else 0)
+    best, best_angle = -1.0, 0.0
+    for tenth in range(-100, 101, 5):
+        rot = ink.rotate(tenth / 10, resample=Image.BILINEAR)
+        rows = rot.resize((1, rot.height), Image.BOX).tobytes()
+        mean = sum(rows) / len(rows)
+        score = sum((r - mean) ** 2 for r in rows)
+        if score > best:
+            best, best_angle = score, tenth / 10
+    return best_angle
+
+
+def _enhance(img):  # noqa: ANN001
+    """For phone photos: flatten shadows (divide out the paper background), then straighten the page."""
+    from PIL import Image, ImageChops, ImageFilter, ImageOps
+
+    if img.width < 2200:
+        scale = 2200 / img.width
+        img = img.resize((int(img.width * scale), int(img.height * scale)), Image.LANCZOS)
+    background = img.filter(ImageFilter.MaxFilter(15)).filter(ImageFilter.GaussianBlur(25))
+    flat = Image.eval(ImageChops.subtract(background, img), lambda v: 255 - v)
+    angle = _deskew_angle(flat)
+    if abs(angle) >= 0.5:
+        flat = flat.rotate(angle, resample=Image.BICUBIC, expand=True, fillcolor=255)
+    return ImageOps.autocontrast(flat, cutoff=1)
+
+
+def _ocr_pass(img, langs: str) -> tuple[str, float | None]:  # noqa: ANN001
+    """One Tesseract run; lines are rebuilt from the word boxes so we don't OCR the page twice."""
     import pytesseract
 
+    data = pytesseract.image_to_data(img, lang=langs, config="--psm 6", output_type=pytesseract.Output.DICT)
+    lines: dict[tuple[int, int, int], list[str]] = {}
+    confs = []
+    for i, word in enumerate(data["text"]):
+        if str(data["conf"][i]) in ("-1", "-1.0"):
+            continue
+        confs.append(float(data["conf"][i]))
+        if word.strip():
+            lines.setdefault((data["block_num"][i], data["par_num"][i], data["line_num"][i]), []).append(word)
+    text = "\n".join(" ".join(ws) for _, ws in sorted(lines.items()))
+    return text, (sum(confs) / len(confs) / 100 if confs else None)
+
+
+def _mostly_latin(text: str) -> bool:
+    deva = len(re.findall(r"[\u0900-\u097F]", text))
+    latin = len(re.findall(r"[A-Za-z]", text))
+    return latin > 0 and deva / (deva + latin) < 0.08
+
+
+def _better(a: tuple[str, float | None], b: tuple[str, float | None], margin: float) -> tuple[str, float | None]:
+    return b if b[1] is not None and (a[1] is None or b[1] > a[1] + margin) else a
+
+
+def _ocr_image(img) -> tuple[str, float | None]:  # noqa: ANN001
     langs = get_settings().ocr_languages
-    img = _preprocess(img)
+    base = _preprocess(img)
     try:
-        data = pytesseract.image_to_data(img, lang=langs, config="--psm 6", output_type=pytesseract.Output.DICT)
-        confs = [float(c) for c in data["conf"] if str(c) not in ("-1", "-1.0")]
-        mean = sum(confs) / len(confs) / 100 if confs else None
+        best = _ocr_pass(base, langs)
+        # Mixed eng+hin models sometimes read Latin glyphs as Devanagari ("HbA1c" → "1081८"). If the page is
+        # essentially English, prefer the Latin-only read unless it is clearly worse.
+        latin_langs = "+".join(code for code in langs.split("+") if code in ("eng", "lat")) or None
+        if latin_langs and latin_langs != langs and _mostly_latin(best[0]):
+            best = _better(best, _ocr_pass(base, latin_langs), -0.03)
+            if best[1] is not None:
+                langs = latin_langs if _mostly_latin(best[0]) else langs
+        if best[1] is not None and best[1] < LOW_CONFIDENCE:
+            best = _better(best, _ocr_pass(_enhance(base), langs), 0.05)
+        return best
     except Exception:  # noqa: BLE001
-        mean = None
-    text = pytesseract.image_to_string(img, lang=langs, config="--psm 6")
-    return text, mean
+        import pytesseract
+
+        return pytesseract.image_to_string(base, lang=langs, config="--psm 6"), None
 
 
 def _page_text(page) -> str:  # noqa: ANN001

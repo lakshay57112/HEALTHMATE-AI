@@ -27,6 +27,8 @@ class Grounder:
     def __init__(self, source: str):
         self.source = norm(source)
         self.numbers = set(re.findall(r"\d+(?:\.\d+)?", self.source))
+        # decimal commas ("1,6 mg/dL"); three digits after a comma is a thousands separator, not a decimal
+        self.numbers |= {a + "." + b for a, b in re.findall(r"(\d+),(\d{1,2})(?!\d)", source or "")}
         self.words = self.source.split()
 
     def number(self, value: str | float | None) -> bool:
@@ -93,9 +95,13 @@ def validate(doc_type: str, data: dict, source_text: str, *, base_confidence: fl
         for i, t in enumerate(data.get("tests", [])):
             f_item: list[dict] = []
             c = base_confidence * ocr_factor
-            if not g.number(t.get("value_text")):
+            vt = str(t.get("value_text") or "")
+            numeric = bool(re.search(r"\d", vt))
+            if not (g.number(vt) if numeric else g.text(vt, 0.8)):
                 f_item.append(flag("not_in_source", "Value not found in the document", "high", f"tests.{i}.value_text"))
                 c *= 0.3
+            if numeric and not t.get("unit"):
+                f_item.append(flag("missing_unit", "No unit printed for this value — check it on the paper report", "info", f"tests.{i}.unit"))
             if not g.text(t.get("name"), 0.8):
                 f_item.append(flag("not_in_source", "Test name not found in the document", "high", f"tests.{i}.name"))
                 c *= 0.5
@@ -106,6 +112,8 @@ def validate(doc_type: str, data: dict, source_text: str, *, base_confidence: fl
             if not t.get("ref_text") and t.get("ref_low") is None and t.get("ref_high") is None:
                 f_item.append(flag("no_reference", "No reference range printed — status cannot be determined", "info", f"tests.{i}"))
                 c *= 0.9
+            elif numeric and t.get("ref_text") and t.get("ref_low") is None and t.get("ref_high") is None:
+                f_item.append(flag("complex_reference", "The reference is printed as text, so HealthMate won't mark this high or low — read it on the report", "info", f"tests.{i}"))
             canon = canonicalize(t.get("name", ""))
             try:
                 val = float(str(t.get("value_text")).strip("<> ").replace(",", "."))
@@ -125,14 +133,15 @@ def validate(doc_type: str, data: dict, source_text: str, *, base_confidence: fl
     elif doc_type == "prescription":
         doc_field("doctor_name", data.get("doctor_name"))
         doc_field("prescribed_date", data.get("prescribed_date"), "date")
-        generics = set()
+        generics: dict[str, str] = {}
         for i, m in enumerate(data.get("medicines", [])):
             f_item = []
             c = base_confidence * ocr_factor
             if not g.text(m.get("name"), 0.8):
                 f_item.append(flag("not_in_source", "Medicine name not found in the document — do not take a medicine you are unsure of.", "high", f"medicines.{i}.name"))
                 c *= 0.3
-            if m.get("strength") and not g.number(re.sub(r"[^\d.]", "", m["strength"]) or None):
+            nums = re.findall(r"\d+(?:\.\d+)?", m.get("strength") or "")
+            if nums and not all(g.number(n) for n in nums):
                 f_item.append(flag("not_in_source", "Strength not found in the document", "high", f"medicines.{i}.strength"))
                 c *= 0.4
             if not m.get("strength"):
@@ -142,6 +151,9 @@ def validate(doc_type: str, data: dict, source_text: str, *, base_confidence: fl
             if not fp.recognized:
                 f_item.append(flag("unclear_frequency", "How often to take this is unclear. Choose the times shown on your prescription or ask your doctor/pharmacist.", "high", f"medicines.{i}.frequency"))
                 c *= 0.5
+            elif fp.non_daily:
+                f_item.append(flag("non_daily", f"This is not taken every day ({m.get('frequency')}). HealthMate only sets daily reminders, so it will be saved "
+                                   "without automatic reminders — log it on the day you take it.", "warning", f"medicines.{i}.frequency"))
             elif fp.as_needed:
                 f_item.append(flag("as_needed", "Take only when needed — no automatic reminder will be set", "info", f"medicines.{i}.frequency"))
             if not m.get("dosage"):
@@ -149,15 +161,23 @@ def validate(doc_type: str, data: dict, source_text: str, *, base_confidence: fl
                 c *= 0.9
             if not m.get("duration_days"):
                 f_item.append(flag("missing_duration", "Duration not written — reminders continue until you stop them", "info", f"medicines.{i}.duration_days"))
-            gen = (m.get("generic_name") or m.get("name") or "").lower().split("+")[0].strip()
-            rng = STRENGTH_RANGES_MG.get(gen.split()[0] if gen else "")
-            sm = re.match(r"(\d+(?:\.\d+)?)\s*mg", (m.get("strength") or "").lower())
-            if rng and sm and not (rng[0] <= float(sm.group(1)) <= rng[1]):
-                f_item.append(flag("unusual_strength", "This strength is unusual for this medicine. Please confirm with your pharmacist before taking it.", "high", f"medicines.{i}.strength"))
-                c *= 0.5
-            if gen and gen in generics:
-                f_item.append(flag("duplicate_medicine", "This medicine appears twice — check with your doctor", "warning", f"medicines.{i}"))
-            generics.add(gen)
+            parts = [p.strip() for p in (m.get("generic_name") or m.get("name") or "").lower().split("+") if p.strip()]
+            st = (m.get("strength") or "").lower()
+            doses = re.findall(r"\d+(?:\.\d+)?", st) if st.endswith("mg") else []
+            # combination tablets: "Glimepiride + Metformin" with "2/500mg" → check each ingredient against its own range
+            pairs = list(zip(parts, doses)) if len(parts) == len(doses) else ([(parts[0], doses[0])] if len(parts) == 1 and len(doses) == 1 else [])
+            for ingredient, dose in pairs:
+                rng = STRENGTH_RANGES_MG.get(ingredient.split()[0])
+                if rng and not (rng[0] <= float(dose) <= rng[1]):
+                    f_item.append(flag("unusual_strength", "This strength is unusual for this medicine. Please confirm with your pharmacist before taking it.", "high", f"medicines.{i}.strength"))
+                    c *= 0.5
+                    break
+            shared = [p for p in parts if p in generics]
+            if shared:
+                f_item.append(flag("duplicate_medicine", f"{generics[shared[0]]} on this prescription also contains {shared[0].title()}. "
+                                   "Taking both may double the dose — confirm with your doctor that both are intended.", "warning", f"medicines.{i}"))
+            for p in parts:
+                generics.setdefault(p, m.get("name") or p)
             if m.get("generic_source") == "dictionary":
                 f_item.append(flag("generic_from_dictionary", "Generic name identified from the brand name, not printed on the prescription", "info", f"medicines.{i}.generic_name"))
             items_meta.append({"index": i, "confidence": round(c, 2), "flags": f_item})

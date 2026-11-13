@@ -9,7 +9,7 @@ from __future__ import annotations
 import re
 from datetime import date, datetime
 
-from app.services.medical_knowledge import BRAND_TO_GENERIC
+from app.services.medical_knowledge import BRAND_TO_GENERIC, scan_injection
 from app.services.extraction.schemas import (
     AppointmentExtraction,
     ConsultationExtraction,
@@ -81,8 +81,16 @@ def parse_time(text: str) -> str | None:
 
 
 def find_doctor(text: str) -> str | None:
-    m = re.search(r"\bDr\.?[ \t]+([A-Z][a-zA-Z.]+(?:[ \t]+[A-Z][a-zA-Z.]+){0,3})", text)
+    m = re.search(r"\bDr\.?[ \t]{1,2}([A-Z][a-zA-Z.]+(?:[ \t]{1,2}[A-Z][a-zA-Z.]+){0,3})", text)
     return f"Dr. {m.group(1).strip().rstrip('.')}" if m else None
+
+
+def column_with(line: str, pattern: str) -> str:
+    """Two-column letterheads come out as 'Dr. A Mehta    Sunrise Clinic'; return the column matching `pattern`."""
+    for part in re.split(r"\s{3,}", line.strip()):
+        if re.search(pattern, part, re.I):
+            return part.strip()
+    return line.strip()
 
 
 def find_patient_name(text: str) -> str | None:
@@ -115,11 +123,22 @@ def classify(text: str) -> tuple[str, float, dict[str, int]]:
 # ------------------------------------------------------------------ lab reports
 NUM = r"[<>]?\s?\d+(?:[.,]\d+)?"
 RANGE = rf"(?:{NUM}\s*(?:-|–|to)\s*{NUM}|(?:<|>|<=|>=|≤|≥|up\s*to)\s*\d+(?:\.\d+)?)"
-UNIT = r"(?:[a-zA-Zµμ%/][a-zA-Zµμ0-9%/.^*\- ]{0,14}?)"
+UNIT = r"(?:10\^\d+/[a-zA-Zµμ]+|[a-zA-Zµμ%/][a-zA-Zµμ0-9%/.^*\- ]{0,14}?)"
 LAB_LINE = re.compile(
     rf"^\s*(?P<name>[A-Za-z][A-Za-z0-9 ()/,.'\-]{{1,48}}?)\s*[:|]?\s+(?P<value>{NUM})\s*(?P<flag>\b[HL]\b|\(H\)|\(L\)|High|Low)?\s*(?P<unit>{UNIT})?\s*[|]?\s*(?P<ref>{RANGE})?\s*(?P<flag2>\b[HL]\b|High|Low)?\s*$",
     re.IGNORECASE,
 )
+QUAL = r"(?:not detected|non[- ]?reactive|present|absent|nil|positive|negative|trace|detected|reactive)(?:\s*\(\+{1,4}\))?"
+QUAL_LINE = re.compile(
+    rf"^\s*(?P<name>[A-Za-z][A-Za-z0-9 ()/,.'\-]{{1,48}}?)\s*[:|]?\s{{2,}}(?P<value>{QUAL})(?:\s{{2,}}(?P<ref>{QUAL}))?\s*$",
+    re.IGNORECASE,
+)
+# Rows whose reference is printed as prose ("Deficient < 20, Sufficient 30-100"): keep the text, parse no bounds.
+LOOSE_LINE = re.compile(
+    rf"^\s*(?P<name>[A-Za-z][A-Za-z0-9 ()/,.'\-]{{1,48}}?)\s*[:|]?\s+(?P<value>{NUM})\s*(?P<unit>{UNIT})?\s{{2,}}(?P<ref>[^\n]*?(?:\d\s*(?:-|–|to)\s*\d|[<>]\s*\d)[^\n]*)$",
+    re.IGNORECASE,
+)
+PENDING = re.compile(r"\b(pending|awaited|to follow|not done|sample rejected|insufficient sample)\b", re.I)
 SKIP_NAMES = re.compile(r"^(page|date|age|sex|gender|phone|mobile|sample|reg|lab no|report|patient|ref\.? by|collected|received|uhid|id|name|tel|pin|time)\b", re.I)
 
 
@@ -150,20 +169,34 @@ def extract_lab_report(text: str) -> tuple[LabReportExtraction, dict]:
         if re.fullmatch(r"[A-Z][A-Z &/()\-]{4,60}", line) and not re.search(r"\d", line):
             group = line.title()
             continue
-        if SKIP_NAMES.match(line):
-            continue
+        if SKIP_NAMES.match(line) or PENDING.search(line):
+            continue  # a pending result has no value yet — never let a neighbouring number stand in for it
         m = LAB_LINE.match(line)
+        loose = False
         if not m:
-            continue
+            q = QUAL_LINE.match(line)
+            if q:
+                qname = q.group("name").strip(" :-|")
+                if len(qname) >= 2 and not SKIP_NAMES.match(qname) and not re.search(r"\s{3,}", qname):
+                    tests.append(LabParameter(test_group=group, name=qname, value_text=re.sub(r"\s+", " ", q.group("value")),
+                                              ref_text=q.group("ref")))
+                continue
+            m = LOOSE_LINE.match(line)
+            loose = True
+            if not m:
+                continue
         name = m.group("name").strip(" :-|")
-        if len(name) < 2 or SKIP_NAMES.match(name):
-            continue
+        if len(name) < 2 or SKIP_NAMES.match(name) or re.search(r"\s{3,}", name):
+            continue  # a wide gap inside the "name" means two columns were swallowed
         ref = (m.group("ref") or "").strip() or None
-        lo, hi = parse_range(ref)
+        if loose and ref:
+            ref = re.sub(r"\s{2,}", " ", ref)[:120]
+        lo, hi = (None, None) if loose else parse_range(ref)
         unit = (m.group("unit") or "").strip() or None
         if unit and re.fullmatch(r"(to|-)", unit, re.I):
             unit = None
-        flag = (m.group("flag") or m.group("flag2") or "").strip("() ").upper()[:1] or None
+        gd = m.groupdict()
+        flag = (gd.get("flag") or gd.get("flag2") or "").strip("() ").upper()[:1] or None
         if not ref:
             partial += 1
         tests.append(LabParameter(test_group=group, name=name, value_text=m.group("value").replace(" ", ""), unit=unit, ref_text=ref, ref_low=lo, ref_high=hi, flag_in_report=flag))
@@ -171,16 +204,22 @@ def extract_lab_report(text: str) -> tuple[LabReportExtraction, dict]:
     lab_name = None
     for line in text.splitlines()[:12]:
         if re.search(r"(laborator(y|ies)|diagnostics?|patholog(y|ies)|labs?\b|hospital|clinic)", line, re.I):
-            lab_name = line.strip()[:120]
+            lab_name = column_with(line, r"(laborator|diagnostic|patholog|lab|hospital|clinic)")[:120]
             break
     title = None
     groups: list[str] = []
-    for line in text.splitlines()[:25]:
+    test_groups = {t.test_group for t in tests if t.test_group}
+    for line in text.splitlines()[:15]:
         ln = line.strip()
+        if scan_injection(ln):
+            continue
         if re.fullmatch(r"[A-Z][A-Z &/()\-]{4,60}", ln) and not re.search(r"\d", ln):
+            if ln.title() not in test_groups and len(ln) >= 10:
+                title = ln.title()[:120]  # e.g. "COMPREHENSIVE HEALTH CHECKUP - ADVANCED" sits above the sections
+                break
             groups.append(ln.title())  # section heading, not a title
             continue
-        if len(ln) >= 8 and re.search(r"\b(report|profile|panel)\b", ln, re.I) and not re.search(r"date|no\.|sample|computer-generated|reference", ln, re.I):
+        if len(ln) >= 8 and re.search(r"\b(report|profile|panel)\b", ln, re.I) and not re.search(r"date|no\.|sample|computer-generated|reference|copy|fictional", ln, re.I):
             title = ln[:120]
             break
     if not title:
@@ -189,15 +228,15 @@ def extract_lab_report(text: str) -> tuple[LabReportExtraction, dict]:
                 groups.append(t.test_group)
         names = [re.sub(r"\s+(Profile|Function|Panel|Test|Tests)$", "", g) for g in groups[:4]]
         title = (", ".join(names[:-1]) + " & " + names[-1] + " tests") if len(names) > 1 else (f"{names[0]} tests" if names else None)
-    report_date = find_labeled_date(text, ["report(ed)? (date|on)", "date of report", "collected on", "collection date", "sample date", "date"])
+    report_date = find_labeled_date(text, ["report(ed)? (date|on)", "date of report", "reported", "collected on", "collection date", "collected", "sample date", "date"])
     meta = {"matched_lines": len(tests), "lines_without_reference": partial}
     return LabReportExtraction(lab_name=lab_name, report_date=report_date, patient_name=find_patient_name(text), title=title, tests=tests), meta
 
 
 # ------------------------------------------------------------------ prescriptions
 FORM_RE = r"(?P<form>tab(?:let)?s?|cap(?:sule)?s?|syp|syrup|inj(?:ection)?|drops?|oint(?:ment)?|cream|sachet|inh(?:aler)?)\.?"
-STRENGTH_RE = re.compile(r"(\d+(?:\.\d+)?\s*(?:mg|mcg|µg|g|ml|iu|units?|%)(?:\s*/\s*\d+(?:\.\d+)?\s*(?:mg|mcg|ml))?)", re.I)
-FREQ_RE = re.compile(r"\b([01½]\s*-\s*[01½]\s*-\s*[01½](?:\s*-\s*[01½])?)\b|\b(OD|BD|BID|TDS|TID|QID|HS|SOS|PRN|once daily|twice daily|thrice daily|at bedtime)\b", re.I)
+STRENGTH_RE = re.compile(r"(\d+(?:\.\d+)?(?:\s*/\s*\d+(?:\.\d+)?)*\s*(?:mg|mcg|µg|g|ml|iu|units?|%)(?:\s*/\s*\d+(?:\.\d+)?\s*(?:mg|mcg|ml))?)(?![a-z])", re.I)
+FREQ_RE = re.compile(r"\b([01½]\s*-\s*[01½]\s*-\s*[01½](?:\s*-\s*[01½])?)\b|\b(OD|BD|BID|TDS|TID|QID|HS|SOS|PRN|once daily|twice daily|thrice daily|at bedtime|once a week|once weekly|weekly|alternate days?|every other day|once a month|monthly|hafte mein ek baar)\b", re.I)
 DURATION_RE = re.compile(r"(?:x|for|×)?\s*(\d+)\s*(day|days|week|weeks|wk|wks|month|months)\b", re.I)
 MEAL_PATTERNS = [
     (r"empty stomach", "empty_stomach"),
@@ -221,8 +260,9 @@ def _dosage_from_pattern(freq: str | None, form: str | None) -> str | None:
 
 def extract_prescription(text: str) -> tuple[PrescriptionExtraction, dict]:
     meds: list[RxMedicine] = []
-    lines = [ln.strip() for ln in text.splitlines()]
-    med_line = re.compile(rf"^\s*(?:\d+[.)]\s*)?{FORM_RE}\s+(?P<rest>.+)$", re.I)
+    # Phone photos often add specks before a line ("; 1. Tab.", "| 4, Syp.") — drop leading non-word marks.
+    lines = [re.sub(r"^[^\w]+", "", ln.strip()) for ln in text.splitlines()]
+    med_line = re.compile(rf"^\s*(?:\d+\s*[.,)]\s*)?{FORM_RE}\s+(?P<rest>.+)$", re.I)
     for line in lines:
         m = med_line.match(line)
         if not m:
@@ -247,7 +287,13 @@ def extract_prescription(text: str) -> tuple[PrescriptionExtraction, dict]:
         if not name:
             continue
         freq_m = FREQ_RE.search(rest)
-        freq = re.sub(r"\s+", "", freq_m.group(1)) if freq_m and freq_m.group(1) else (freq_m.group(2).upper() if freq_m else None)
+        if freq_m and freq_m.group(1):
+            freq = re.sub(r"\s+", "", freq_m.group(1))
+        elif freq_m:
+            word = freq_m.group(2)
+            freq = word.upper() if len(word) <= 4 else word.lower()
+        else:
+            freq = None
         meal = "any"
         for pat, rel in MEAL_PATTERNS:
             if re.search(pat, rest, re.I):
@@ -263,14 +309,18 @@ def extract_prescription(text: str) -> tuple[PrescriptionExtraction, dict]:
         im = re.search(r"\b(continue|stop|do not|avoid|if|only)\b.*$", rest, re.I)
         if im:
             instr = im.group(0).strip()[:200]
+        strength = strength_m.group(1).replace(" ", "") if strength_m else None
+        dosage = _dosage_from_pattern(freq, form)
+        if dosage and dosage.startswith("1 ") and strength and form in ("injection", "syrup", "drops") and re.search(r"(units?|iu|ml)$", strength, re.I):
+            dosage = re.sub(r"(\d)([a-zA-Z])", r"\1 \2", strength)  # "14 units" of insulin, "15 ml" of syrup — as printed
         meds.append(RxMedicine(name=name[:120], brand_name=brand, generic_name=generic, generic_source=gsrc, form=form,
-                               strength=strength_m.group(1).replace(" ", "") if strength_m else None,
-                               dosage=_dosage_from_pattern(freq, form), frequency=freq, meal_relation=meal,
+                               strength=strength,
+                               dosage=dosage, frequency=freq, meal_relation=meal,
                                duration_days=dur_days, duration_text=dur_text, instructions=instr))
     clinic = None
     for line in lines[:10]:
         if re.search(r"(clinic|hospital|medical cent(er|re)|nursing home|healthcare)", line, re.I):
-            clinic = line[:150]
+            clinic = column_with(line, r"(clinic|hospital|medical cent|nursing home|healthcare)")[:150]
             break
     notes = []
     for line in lines:
@@ -306,14 +356,47 @@ def restriction_tags(lines: list[str]) -> list[str]:
     return tags
 
 
+ADVICE_WORDS = re.compile(r"\b(avoid|reduce|limit|restrict|eat|include|drink|take|prefer|no |less|more|walk|exercise|do not|don't|use|replace|choose|continue|stop)\b", re.I)
+LIST_HEADING = re.compile(r"^(?:foods?|things|items|what)?\s*(?:to\s+)?(avoid|include|limit|prefer)\b[^.,:;]{0,30}:?$", re.I)
+
+
 def _advice_lines(text: str) -> list[str]:
-    out = []
+    out: list[str] = []
+    carry: str | None = None  # verb of a "Foods to AVOID" heading whose list follows on the next lines
+    buf: list[str] = []
+
+    def flush() -> None:
+        nonlocal carry, buf
+        if carry and buf:
+            out.append(f"{carry.capitalize()}: {' '.join(buf)}"[:240])
+        carry, buf = None, []
+
     for raw in text.splitlines():
-        line = raw.strip(" •*-–\t")
+        line = re.sub(r"^[^\w(]+", "", raw.strip()).strip()  # bullets: •, ●, ▪, , \x7f, -, *
+        if not line:
+            flush()
+            continue
+        cells = re.split(r"\s{3,}", line)
+        if len(cells) >= 3 and not re.search(r"\d", line) and all(len(c.split()) <= 3 for c in cells):
+            continue  # table header such as "Time    Meal    What to eat"
+        head = LIST_HEADING.match(line)
+        if head and len(line) < 45:
+            flush()
+            carry = head.group(1).lower()
+            continue
+        if carry:
+            if ADVICE_WORDS.search(line) and buf:
+                flush()
+            else:
+                buf.append(line)
+                if line.endswith(".") or len(buf) >= 3:
+                    flush()
+                continue
         if len(line) < 6:
             continue
-        if re.search(r"\b(avoid|reduce|limit|restrict|eat|include|drink|take|prefer|no |less|more|walk|exercise|do not|don't|use|replace|choose|continue|stop)\b", line, re.I):
+        if ADVICE_WORDS.search(line):
             out.append(line[:200])
+    flush()
     return out
 
 
@@ -356,7 +439,7 @@ def extract_consultation(text: str) -> tuple[ConsultationExtraction, dict]:
     clinic = None
     for line in text.splitlines()[:10]:
         if re.search(r"(clinic|hospital|medical cent(er|re))", line, re.I):
-            clinic = line.strip()[:150]
+            clinic = column_with(line, r"(clinic|hospital|medical cent)")[:150]
             break
     return ConsultationExtraction(doctor_name=find_doctor(text), specialization=spec.group(1).title() if spec else None, clinic=clinic,
                                   visit_date=find_labeled_date(text, ["date", "visit"]), summary=summary, advice=advice, diet_instructions=diet,

@@ -15,7 +15,9 @@ def test_frequency_patterns():
     assert scheduling.parse_frequency("BD").slots == ["morning", "night"]
     assert scheduling.parse_frequency("TDS").slots == ["morning", "afternoon", "night"]
     assert scheduling.parse_frequency("SOS").as_needed
-    unknown = scheduling.parse_frequency("once weekly")
+    weekly = scheduling.parse_frequency("once weekly")
+    assert weekly.non_daily and weekly.slots == []  # a weekly dose is never turned into a daily schedule
+    unknown = scheduling.parse_frequency("as directed")
     assert not unknown.recognized and unknown.slots == []
 
 
@@ -60,7 +62,9 @@ def test_prescription_unclear_frequency_is_flagged():
     model, _ = rules.extract_prescription("Tab. Metformin 500 mg - after food\nCap. Uprise D3 60000 IU - once weekly")
     data = model.model_dump()
     review = validate("prescription", data, "Tab. Metformin 500 mg - after food\nCap. Uprise D3 60000 IU - once weekly", base_confidence=0.9, ocr_confidence=None, patient_name=None)
-    assert all(any(f["code"] == "unclear_frequency" for f in i["flags"]) for i in review["items"])
+    metformin, vitamin_d = review["items"]
+    assert any(f["code"] == "unclear_frequency" for f in metformin["flags"])  # no timing written at all
+    assert any(f["code"] == "non_daily" for f in vitamin_d["flags"])  # weekly: saved without daily reminders
 
 
 def test_unusual_strength_flag():

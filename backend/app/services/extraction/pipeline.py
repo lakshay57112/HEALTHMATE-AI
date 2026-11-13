@@ -12,6 +12,7 @@ patient's confirmation (services.extraction.commit) changes connected modules �
 from __future__ import annotations
 
 import logging
+import re
 import time
 from collections.abc import Callable
 from typing import Any
@@ -25,7 +26,7 @@ from app.services.extraction import rules
 from app.services.extraction.llm_extractor import llm_extract
 from app.services.extraction.validator import validate
 from app.services.llm import LLMError, get_llm
-from app.services.medical_knowledge import scan_injection
+from app.services.medical_knowledge import scan_injection, strip_injection_lines
 from app.services.observability import Tracer
 from app.services.storage import load_file
 
@@ -63,12 +64,14 @@ def node_ocr(db: Session, st: State, tr: Tracer) -> State:
 def node_injection_guard(db: Session, st: State, tr: Tracer) -> State:
     hits = scan_injection(st.get("text", ""))
     st["injection_hits"] = hits
+    # Extraction and grounding only ever see the cleaned text, so injected lines cannot become data or titles.
+    st["clean_text"] = strip_injection_lines(st.get("text", "")) if hits else st.get("text", "")
     tr.guardrail("prompt_injection_scan", "flagged" if hits else "pass", ", ".join(hits))
     return {"detail": "Suspicious instructions found and neutralised" if hits else "No hidden instructions found", "status": "warning" if hits else "ok"}
 
 
 def node_classifier(db: Session, st: State, tr: Tracer) -> State:
-    detected, conf, scores = rules.classify(st.get("text", ""))
+    detected, conf, scores = rules.classify(st.get("clean_text", st.get("text", "")))
     declared = st["doc"].declared_type
     st["type_scores"] = scores
     if declared and declared != "auto":
@@ -91,7 +94,7 @@ def node_extractor(db: Session, st: State, tr: Tracer) -> State:
     if llm is not None:
         try:
             with tr.span("llm_extract", kind="llm", doc_type=doc_type, model=llm.model) as sp:
-                model, usage, hit = llm_extract(db, llm, doc_type, st["text"])
+                model, usage, hit = llm_extract(db, llm, doc_type, st.get("clean_text", st["text"]))
                 tr.add_usage(usage)
                 sp.set(cache_hit=hit, **{k: v for k, v in usage.items()})
             st["extraction"], st["extractor"], st["base_conf"] = model.model_dump(), f"{llm.name}:{llm.model}", 0.88
@@ -99,7 +102,7 @@ def node_extractor(db: Session, st: State, tr: Tracer) -> State:
         except (LLMError, Exception) as exc:  # noqa: BLE001 — fall back to deterministic rules
             log.warning("LLM extraction failed, falling back to rules: %s", type(exc).__name__)
             st.setdefault("warnings", []).append("AI extraction was unavailable, so the rule-based reader was used.")
-    model, meta = rules.EXTRACTORS[doc_type](st["text"])
+    model, meta = rules.EXTRACTORS[doc_type](st.get("clean_text", st["text"]))
     st["extraction"], st["extractor"] = model.model_dump(), "rules-v1"
     st["base_conf"] = 0.9 if meta.get("matched_lines", 1) else 0.5
     return {"detail": f"Rule-based reader · {meta.get('matched_lines', 0)} items" if "matched_lines" in meta else "Rule-based reader"}
@@ -107,15 +110,30 @@ def node_extractor(db: Session, st: State, tr: Tracer) -> State:
 
 def node_review(db: Session, st: State, tr: Tracer) -> State:
     user: User = st["user"]
-    review = validate(st["detected_type"], st.get("extraction") or {}, st.get("text", ""), base_confidence=st.get("base_conf", 0.0),
+    text = st.get("clean_text", st.get("text", ""))
+    review = validate(st["detected_type"], st.get("extraction") or {}, text, base_confidence=st.get("base_conf", 0.0),
                       ocr_confidence=st.get("ocr_conf"), patient_name=user.full_name)
     review["flags"] = st.get("extra_flags", []) + review["flags"]
+    from sqlalchemy import select as _select
+
+    from app.models import PrescriptionMedicine
+
+    active = db.scalars(_select(PrescriptionMedicine).where(PrescriptionMedicine.user_id == user.id, PrescriptionMedicine.is_active.is_(True))).all()
+    if st.get("ocr_method") in ("pdf_ocr", "image_ocr"):
+        review["flags"].append({"code": "scanned_document", "severity": "warning", "path": None,
+                                "message": "This was read from a scan or photo, where numbers are easy to misread (1.7 can become 7). "
+                                           "Compare every value with the original before saving."})
+    for name in stopped_medicines(text, active):
+        review["flags"].append({"code": "stop_instruction", "severity": "high", "path": None,
+                                "message": f"This document says to stop {name}, which is still in your medicines. HealthMate never changes your "
+                                           "medicines on its own — confirm with your doctor, then pause it on the Medicines page."})
+    if st["detected_type"] in ("consultation_note", "diet_advice", "other") and st["doc"].declared_type in (None, "auto"):
+        listed, _ = rules.extract_prescription(text)
+        if len(listed.medicines) >= 2:
+            review["flags"].append({"code": "contains_medicines", "severity": "info", "path": None,
+                                    "message": f"This document also lists {len(listed.medicines)} medicines. To add them to your reminders, upload it "
+                                               "again and choose 'Prescription' as the document type."})
     if st["detected_type"] == "prescription":
-        from sqlalchemy import select as _select
-
-        from app.models import PrescriptionMedicine
-
-        active = db.scalars(_select(PrescriptionMedicine).where(PrescriptionMedicine.user_id == user.id, PrescriptionMedicine.is_active.is_(True))).all()
         keyset = {(m.generic_name or m.name).lower().split("+")[0].strip(): m.name for m in active}
         dups = []
         for i, m in enumerate((st.get("extraction") or {}).get("medicines", [])):
@@ -134,6 +152,22 @@ def node_review(db: Session, st: State, tr: Tracer) -> State:
     n_high = sum(1 for f in review["flags"] if f["severity"] == "high") + sum(1 for i in review["items"] for f in i["flags"] if f["severity"] == "high")
     tr.guardrail("grounding_and_safety", "flagged" if n_high else "pass", f"{n_high} high-severity flags")
     return {"detail": f"Confidence {round(review['overall_confidence'] * 100)}% · {n_high} item(s) need attention"}
+
+
+STOP_LINE = re.compile(r"\b(stop|stopped|discontinue|discontinued|band karein|band kar)\b", re.I)
+
+
+def stopped_medicines(text: str, active: list) -> list[str]:
+    """Active medicines named on a line that says stop/discontinue (e.g. a discharge summary). Deterministic."""
+    lines = [ln for ln in text.splitlines() if STOP_LINE.search(ln) and not re.search(r"\b(do not|don'?t|never|not to)\s+stop\b", ln, re.I)]
+    out: list[str] = []
+    for med in active:
+        names = {n for n in (med.name, med.brand_name) if n and len(n) >= 4}
+        if med.generic_name:
+            names |= {g.strip() for g in med.generic_name.split("+") if len(g.strip()) >= 5}
+        if any(re.search(rf"(?<![A-Za-z]){re.escape(n)}(?![A-Za-z])", ln, re.I) for n in names for ln in lines) and med.name not in out:
+            out.append(med.name)
+    return out
 
 
 GRAPH: list[tuple[str, Node]] = [
